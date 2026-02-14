@@ -111,7 +111,7 @@ python evaluation/evaluate_sintel.py --dataset_root /path/to/Sintel
 ### 2. Moving object segmentation
 For moving object segmentation, we evaluate our method on DAVIS Dataset.
 
-Download the data [here](https://davischallenge.org/index.html) and unzip it to your desired location. We test on both DAVIS2016 and DAVIS2017 setset.
+Download the data [here](https://davischallenge.org/index.html) and unzip it to your desired location. We test on both DAVIS2016 and DAVIS2017 datasets.
 We use the same sequence as reported in [Easi3R](https://github.com/Inception3D/Easi3R), so you may need to specify the sequences for evaluation by selecting `secen_list` from `davis_2016` or `davis_2017`.
 
 ```
