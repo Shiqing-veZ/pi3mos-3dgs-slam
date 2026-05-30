@@ -1,29 +1,71 @@
 import os
 import cv2
 import numpy as np
+import json
 from multiprocessing import Process, Queue
 from pathlib import Path
 from itertools import chain
 
-def image_stream_tum(queue, imagedir, calib, stride, edge=0, skip=0):
-    """ image generator; calib can be None/empty -> no intrinsics """
 
+def _load_calib(calib):
     intrinsics = None
     K = None
-    if calib and os.path.isfile(calib):
+    calib_arr = None
+    if not calib or not os.path.isfile(calib):
+        return intrinsics, K, calib_arr
+
+    calib_path = Path(calib)
+    if calib_path.suffix.lower() == ".json":
+        with calib_path.open("r") as f:
+            data = json.load(f)
+        color = data.get("color", data)
+        fx = float(color["fx"])
+        fy = float(color["fy"])
+        cx = float(color["ppx"])
+        cy = float(color["ppy"])
+        coeffs = np.asarray(color.get("coeffs", []), dtype=np.float64)
+        calib_arr = np.concatenate([np.array([fx, fy, cx, cy], dtype=np.float64), coeffs], axis=0)
+    else:
         try:
             calib_arr = np.loadtxt(calib, delimiter=" ")
         except ValueError:
             calib_arr = np.loadtxt(calib, delimiter=None)
-        fx, fy, cx, cy = calib_arr[:4]
-        intrinsics = np.array([fx, fy, cx, cy])
-        K = np.eye(3)
-        K[0,0] = fx
-        K[0,2] = cx
-        K[1,1] = fy
-        K[1,2] = cy
+
+    fx, fy, cx, cy = calib_arr[:4]
+    intrinsics = np.array([fx, fy, cx, cy], dtype=np.float64)
+    K = np.eye(3, dtype=np.float64)
+    K[0, 0] = fx
+    K[0, 2] = cx
+    K[1, 1] = fy
+    K[1, 2] = cy
+    return intrinsics, K, calib_arr
+
+
+def _load_rgb_timestamps(imagedir):
+    rgb_txt = Path(imagedir).parent / "rgb.txt"
+    if not rgb_txt.exists():
+        return None
+
+    timestamps = {}
+    with rgb_txt.open("r") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split()
+            if len(parts) < 2:
+                continue
+            rel_path = parts[1]
+            timestamps[Path(rel_path).name] = float(parts[0])
+    return timestamps
+
+def image_stream_tum(queue, imagedir, calib, stride, edge=0, skip=0):
+    """ image generator; calib can be None/empty -> no intrinsics """
+
+    intrinsics, K, calib_arr = _load_calib(calib)
 
     image_list = sorted(Path(imagedir).glob("*.png"))[skip::stride]
+    timestamps = _load_rgb_timestamps(imagedir)
     assert os.path.exists(imagedir), imagedir
 
     if edge>0 and intrinsics is not None:
@@ -42,27 +84,15 @@ def image_stream_tum(queue, imagedir, calib, stride, edge=0, skip=0):
         image = image[:h-h%16, :w-w%16]
 
 
-        queue.put((float(imfile.stem), image, intrinsics))
+        tstamp = float(imfile.stem) if timestamps is None else float(timestamps.get(imfile.name, len(image_list)))
+        queue.put((tstamp, image, intrinsics))
 
     queue.put((-1, image, intrinsics))
 
 
 def image_stream(queue, imagedir, calib, stride, edge=0, skip=0):
     """ image generator; calib can be None/empty -> no intrinsics """
-    intrinsics = None
-    K = None
-    if calib and os.path.isfile(calib):
-        try:
-            calib_arr = np.loadtxt(calib, delimiter=" ")
-        except ValueError:
-            calib_arr = np.loadtxt(calib, delimiter=None)
-        fx, fy, cx, cy = calib_arr[:4]
-        intrinsics = np.array([fx, fy, cx, cy])
-        K = np.eye(3)
-        K[0,0] = fx
-        K[0,2] = cx
-        K[1,1] = fy
-        K[1,2] = cy
+    intrinsics, K, calib_arr = _load_calib(calib)
 
     img_exts = ["*.png", "*.jpeg", "*.jpg"]
     image_list = sorted(chain.from_iterable(Path(imagedir).glob(e) for e in img_exts))[skip::stride]
@@ -92,20 +122,7 @@ def image_stream(queue, imagedir, calib, stride, edge=0, skip=0):
 
 def video_stream(queue, imagedir, calib, stride, edge, skip=0):
     """ video generator; calib can be None/empty -> no intrinsics """
-    intrinsics = None
-    K = None
-    if calib and os.path.isfile(calib):
-        try:
-            calib_arr = np.loadtxt(calib, delimiter=" ")
-        except ValueError:
-            calib_arr = np.loadtxt(calib, delimiter=None)
-        fx, fy, cx, cy = calib_arr[:4]
-        intrinsics = np.array([fx, fy, cx, cy])
-        K = np.eye(3)
-        K[0,0] = fx
-        K[0,2] = cx
-        K[1,1] = fy
-        K[1,2] = cy
+    intrinsics, K, calib_arr = _load_calib(calib)
 
     assert os.path.exists(imagedir), imagedir
     cap = cv2.VideoCapture(imagedir)
@@ -146,4 +163,3 @@ def video_stream(queue, imagedir, calib, stride, edge, skip=0):
 
     queue.put((-1, None, None))
     cap.release()
-

@@ -1,4 +1,5 @@
 import os
+import json
 import sys
 import time
 import signal
@@ -6,6 +7,7 @@ from argparse import ArgumentParser
 from multiprocessing import Process, Queue
 from pathlib import Path
 
+import cv2
 import numpy as np
 import torch
 import torch.multiprocessing as mp
@@ -16,11 +18,13 @@ from scipy.spatial.transform import Rotation as R
 # DPVO imports
 from dpvo.config import cfg
 from dpvo.dpvo import DPVO
-from dpvo.plot_utils import save_ply
 from dpvo.stream import image_stream, image_stream_tum, video_stream
-from utils.eval_traj import run_eval_tum
+from utils.eval_traj import eval_tum_stats, infer_timestamps_from_rgb_list, run_eval_tum
 from dpvo.lietorch import SE3
 from pi3.utils.geometry import depth_edge
+from mapping.io_utils import save_ply
+from evaluation.evaluate_gaussian_renderings import evaluate as evaluate_renderings
+from evaluation.evaluate_gaussian_nvs import evaluate_nvs
 
 class Keyframe:
     """Simple keyframe class for GUI visualization"""
@@ -48,7 +52,13 @@ class Pi_SAM:
         self.edge = config.get("edge", 0)
         self.gt = config.get("gt", None)
         self.save_outputs = config.get("save_outputs", True)
+        self.save_rendered_images = config.get("save_rendered_images", True)
+        self.save_gaussian_map_enabled = config.get("save_gaussian_map", False)
+        self.save_debug_maps = config.get("save_debug_maps", False)
         self.output_dir = Path(config.get("output_dir", "outputs/demo"))
+        self.render_dir = self.output_dir / "rendered"
+        self.eval_gt_dir = config.get("eval_gt_dir", None)
+        self.eval_out_dir = config.get("eval_out_dir", None)
 
         
         # Initialize parameters
@@ -137,13 +147,130 @@ class Pi_SAM:
         colors_uint8 = np.clip(colors * 255.0, 0, 255).astype(np.uint8)
         save_ply(str(self.output_dir / "pi3_predicted_points"), points.astype(np.float32), colors_uint8)
 
+    def save_gaussian_map(self):
+        if not self.save_gaussian_map_enabled:
+            return
+        if self.slam is None or getattr(self.slam, "gaussian_bridge", None) is None:
+            return
+        self.slam.gaussian_bridge.save(self.output_dir / "gaussian_map")
+
+    def save_gaussian_summary(self):
+        if self.slam is None or getattr(self.slam, "gaussian_bridge", None) is None:
+            return
+        summary = self.slam.gaussian_bridge.mapper.summary()
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        with (self.output_dir / "gaussian_summary.json").open("w") as f:
+            json.dump(summary, f, indent=2)
+
+    def save_run_config(self):
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        run_cfg = {
+            "imagedir": self.imagedir,
+            "calib": self.calib,
+            "stride": self.stride,
+            "tum": self.tum,
+            "edge": self.edge,
+            "output_dir": str(self.output_dir),
+            "save_rendered_images": self.save_rendered_images,
+            "save_gaussian_map": self.save_gaussian_map_enabled,
+            "gaussian": {
+                "enabled": bool(getattr(self.slam_config, "GAUSSIAN_MAPPING", False)),
+                "window_size": int(getattr(self.slam_config, "GAUSSIAN_WINDOW_SIZE", 0)),
+                "init_window_size": int(getattr(self.slam_config, "GAUSSIAN_INIT_WINDOW_SIZE", 0)),
+                "motion_score": float(getattr(self.slam_config, "GAUSSIAN_MIN_MOTION_SCORE", 0.0)),
+                "dynamic_thresh": float(getattr(self.slam_config, "GAUSSIAN_DYNAMIC_THRESH", 0.0)),
+                "confidence_thresh": float(getattr(self.slam_config, "GAUSSIAN_INIT_CONF_THRESH", 0.0)),
+                "final_refine_iters": int(getattr(self.slam_config, "GAUSSIAN_FINAL_REFINEMENT_ITERS", 0)),
+            },
+        }
+        with (self.output_dir / "run_config.json").open("w") as f:
+            json.dump(run_cfg, f, indent=2)
+
+    def save_rendered_frame(self, frame_idx, input_img):
+        if not self.save_rendered_images:
+            return None
+        if self.slam is None or getattr(self.slam, "gaussian_bridge", None) is None:
+            return None
+
+        render_pkg = self.slam.gaussian_bridge.render_frame(frame_idx)
+        if render_pkg is None:
+            return None
+
+        rendered = torch.clamp(render_pkg["render"], 0.0, 1.0)
+        rendered_np = (rendered.permute(1, 2, 0).detach().cpu().numpy() * 255).astype(np.uint8)
+        self.render_dir.mkdir(parents=True, exist_ok=True)
+        cv2.imwrite(str(self.render_dir / f"frame_{frame_idx:05d}.png"), cv2.cvtColor(rendered_np, cv2.COLOR_RGB2BGR))
+        return rendered
+
     def save_outputs_to_disk(self, poses, tstamps):
         if not self.save_outputs:
             return
 
+        self.save_run_config()
         self.save_trajectory_tum(poses, tstamps)
-        self.save_sparse_map()
-        self.save_predicted_map()
+        if self.save_debug_maps:
+            self.save_sparse_map()
+            self.save_predicted_map()
+        self.save_gaussian_map()
+        self.save_gaussian_summary()
+
+    def resolve_eval_timestamps(self, poses, tstamps):
+        used_timestamps = np.asarray(tstamps, dtype=np.float64)
+        mode = "estimated_timestamps"
+        initial_error = None
+
+        if self.gt is None:
+            return used_timestamps, mode, initial_error
+
+        try:
+            eval_tum_stats(poses, used_timestamps, self.gt)
+        except Exception as exc:
+            initial_error = str(exc)
+            inferred = infer_timestamps_from_rgb_list(self.imagedir, expected_len=len(poses))
+            if inferred is not None:
+                used_timestamps = inferred
+                mode = "rgb_txt_timestamps"
+        return used_timestamps, mode, initial_error
+
+    def infer_nvs_dir(self):
+        image_dir = Path(self.imagedir)
+        if image_dir.is_dir():
+            candidate = image_dir.parent / "nvs"
+            if candidate.exists():
+                return candidate
+        return None
+
+    def evaluate_trajectory_and_save(self, poses, tstamps):
+        if self.gt is None:
+            return None
+
+        stats = None
+        used_timestamps, mode, error_message = self.resolve_eval_timestamps(poses, tstamps)
+
+        try:
+            stats = eval_tum_stats(poses, used_timestamps, self.gt)
+        except Exception as exc:
+            if error_message is None:
+                error_message = str(exc)
+            raise
+
+        result = {
+            "ate_rmse_m": float(stats["rmse"]),
+            "ate_mean_m": float(stats["mean"]),
+            "ate_median_m": float(stats["median"]),
+            "ate_std_m": float(stats["std"]),
+            "ate_min_m": float(stats["min"]),
+            "ate_max_m": float(stats["max"]),
+            "num_frames": int(len(poses)),
+            "timestamp_mode": mode,
+        }
+        if error_message is not None:
+            result["initial_error"] = error_message
+
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        with (self.output_dir / "trajectory_eval.json").open("w") as f:
+            json.dump(result, f, indent=2)
+        return result
 
     def accumulate_predicted_map(self, img, predict_points, dynamic_mask, confidences, estimated_pose):
         if predict_points is None:
@@ -215,6 +342,7 @@ class Pi_SAM:
     @torch.no_grad()
     def run(self):
         queue = Queue(maxsize=8)
+        print("Starting Pi3MOS-SLAM + Gaussian mapping run...", flush=True)
         # Start image reader process
         if os.path.isdir(self.imagedir):
             if self.tum:
@@ -247,6 +375,7 @@ class Pi_SAM:
             
             if self.slam is None:
                 self.slam = DPVO(self.slam_config, self.dpvo_network_path, self.pi3_network_path, ht=H, wd=W)
+                print(f"Loaded SLAM backend for frames of size {H}x{W}", flush=True)
             
             # When intrinsics are provided, pass them; otherwise estimates K internally
             if intrinsics_tensor is not None:
@@ -258,13 +387,22 @@ class Pi_SAM:
             if frame_idx >= 0:
                 pose_matrix = SE3(self.slam.poses[0, frame_idx]).matrix().cpu().numpy()
                 estimated_pose = np.linalg.inv(pose_matrix)
+                render_frame_id = int(self.slam.pg.tstamps_[frame_idx].item())
             else:
                 estimated_pose = np.eye(4, dtype=np.float32)
+                render_frame_id = frame_idx
 
             pred_points_np = pred_colors_np = dynamic_mask_for_gui = None
             if predict_points is not None:
                 pred_points_np, pred_colors_np, dynamic_mask_for_gui = self.accumulate_predicted_map(
                     img, predict_points, dynamic_mask, confidences, estimated_pose
+                )
+            rendered = self.save_rendered_frame(render_frame_id, img)
+            if frame_idx % 10 == 0:
+                print(
+                    f"Frame {frame_idx}: tracked, rendered={rendered is not None}, "
+                    f"gaussian_backend={'on' if getattr(self.slam, 'gaussian_bridge', None) is not None else 'off'}",
+                    flush=True,
                 )
 
             if self.viz:
@@ -305,12 +443,45 @@ class Pi_SAM:
                 time.sleep(0.01)
         
         reader.join()
+        print("Sequence finished, starting backend finalization...", flush=True)
         poses, tstamps = self.slam.terminate()
+        if self.slam is not None and getattr(self.slam, "gaussian_bridge", None) is not None:
+            self.slam.gaussian_bridge.wait_idle()
+            print("Gaussian backend idle, running final refine...", flush=True)
+            self.slam.gaussian_bridge.final_refine(getattr(cfg, "GAUSSIAN_FINAL_REFINEMENT_ITERS", None))
+            if self.save_rendered_images:
+                print("Rendering all frames for evaluation...", flush=True)
+                self.slam.gaussian_bridge.render_all_frames(self.render_dir)
         self.save_outputs_to_disk(poses, tstamps)
+        print(f"Outputs saved to {self.output_dir}", flush=True)
 
         if self.gt is not None:
-            ate = run_eval_tum(poses, tstamps, self.gt)
-            print(f"ATE RMSE: {ate:.4f} m")
+            print("Evaluating trajectory...", flush=True)
+            traj_result = self.evaluate_trajectory_and_save(poses, tstamps)
+            print(f"ATE RMSE: {traj_result['ate_rmse_m']:.4f} m", flush=True)
+
+        if self.slam is not None and getattr(self.slam, "gaussian_bridge", None) is not None:
+            nvs_dir = self.infer_nvs_dir()
+            if nvs_dir is not None and self.gt is not None:
+                eval_out = self.eval_out_dir or (self.output_dir / "render_eval_nvs")
+                used_timestamps, _, _ = self.resolve_eval_timestamps(poses, tstamps)
+                print(f"Evaluating rendered images on NVS protocol from {nvs_dir}...", flush=True)
+                evaluate_nvs(
+                    self.slam.gaussian_bridge,
+                    poses=poses,
+                    timestamps=used_timestamps,
+                    tracking_gt_file=self.gt,
+                    nvs_dir=nvs_dir,
+                    out_dir=eval_out,
+                    save_vis=True,
+                )
+            elif self.eval_gt_dir is not None:
+                eval_out = self.eval_out_dir or (self.output_dir / "render_eval")
+                print("Evaluating rendered images on legacy RGB protocol...", flush=True)
+                evaluate_renderings(self.render_dir, self.eval_gt_dir, eval_out, save_vis=True)
+
+        if self.slam is not None and getattr(self.slam, "gaussian_bridge", None) is not None:
+            self.slam.gaussian_bridge.close()
 
         self.shutdown_gui()
 
@@ -328,6 +499,8 @@ if __name__ == "__main__":
     parser.add_argument("--edge", type=int, default=0, help="The edge need to cut in raw image")
     parser.add_argument("--gt", type=str, default=None, help="TUM-format ground truth file (timestamp tx ty tz qx qy qz qw)")
     parser.add_argument("--output_dir", type=str, default="outputs/demo", help="Directory for saved trajectory and map outputs")
+    parser.add_argument("--eval_gt_dir", type=str, default=None, help="Directory containing GT RGB frames for render evaluation")
+    parser.add_argument("--eval_out_dir", type=str, default=None, help="Directory for render evaluation outputs")
     parser.add_argument("--no_save_outputs", action="store_true", help="Disable saving trajectory and map outputs")
 
     args = parser.parse_args(sys.argv[1:])
@@ -344,7 +517,12 @@ if __name__ == "__main__":
         "edge": args.edge,
         "gt": args.gt,
         "output_dir": args.output_dir,
+        "eval_gt_dir": args.eval_gt_dir,
+        "eval_out_dir": args.eval_out_dir,
         "save_outputs": not args.no_save_outputs,
+        "save_rendered_images": bool(cfg.SAVE_RENDERED_IMAGES),
+        "save_gaussian_map": bool(cfg.SAVE_GAUSSIAN_MAP),
+        "save_debug_maps": False,
     }
 
     pisam = Pi_SAM(config)

@@ -11,6 +11,7 @@ from .lietorch import SE3
 from .net import VONet
 from .patchgraph import PatchGraph
 from .utils import *
+from mapping.gaussian_backend_bridge import GaussianBackendBridge
 
 from safetensors.torch import load_file
 from pi3.utils.basic import preprocess_tensor_for_pi3
@@ -77,6 +78,13 @@ class DPVO:
 
         self.pi3_images_ = None
         self.pi3_dynamic_masks_ = None
+        self.gaussian_bridge = None
+        if bool(getattr(self.cfg, "GAUSSIAN_MAPPING", False)):
+            self.gaussian_bridge = GaussianBackendBridge(
+                self.cfg,
+                device="cuda",
+                output_dir=getattr(self.cfg, "GAUSSIAN_SAVE_DIR", None),
+            )
 
         self.imap_ = torch.zeros(self.pmem, self.M, DIM, **kwargs)
         self.gmap_ = torch.zeros(self.pmem, self.M, 128, self.P, self.P, **kwargs)
@@ -123,6 +131,77 @@ class DPVO:
         dpvo_pose[3:7] = quat  # qx, qy, qz, qw
         
         return dpvo_pose
+
+    def _pose_w2c_matrix(self, frame_id: int) -> torch.Tensor:
+        return SE3(self.pg.poses_[frame_id]).matrix()
+
+    def _global_frame_id(self, local_frame_id: int) -> int:
+        return int(self.pg.tstamps_[local_frame_id].item())
+
+    def _mapping_intrinsics(self, local_frame_id: int, raw_intrinsics: torch.Tensor = None) -> torch.Tensor:
+        if raw_intrinsics is not None:
+            return raw_intrinsics.detach().float()
+        intr = self.pg.intrinsics_[local_frame_id].detach().float()
+        return intr * float(self.RES)
+
+    def _active_pose_provider(self, global_frame_id: int):
+        for local_id in range(self.n):
+            if int(self.pg.tstamps_[local_id].item()) == int(global_frame_id):
+                return self._pose_w2c_matrix(local_id).detach().cpu()
+        return None
+
+    def _pose_motion_score(self, frame_id: int) -> float:
+        if frame_id <= 0:
+            return 1.0
+        try:
+            cur = SE3(self.pg.poses_[frame_id])
+            prev = SE3(self.pg.poses_[frame_id - 1])
+            rel = cur * prev.inv()
+            xi = rel.log()
+            return float(torch.linalg.norm(xi[:3]).item() + 0.5 * torch.linalg.norm(xi[3:]).item())
+        except Exception:
+            return 1.0
+
+    def _build_mapping_packet(
+        self,
+        frame_id: int,
+        timestamp: float,
+        image: torch.Tensor,
+        intrinsics: torch.Tensor,
+        pose_w2c: torch.Tensor,
+        pi3_points: torch.Tensor = None,
+        pi3_depth: torch.Tensor = None,
+        dynamic_mask: torch.Tensor = None,
+        confidence: torch.Tensor = None,
+        is_keyframe_candidate: bool = True,
+        metadata: dict = None,
+    ) -> dict:
+        if image is not None and image.ndim == 3 and image.shape[0] == 3:
+            # Images come from OpenCV as BGR; Gaussian mapping/rendering expects RGB.
+            image = image[[2, 1, 0]]
+        return {
+            "frame_id": int(frame_id),
+            "timestamp": float(timestamp),
+            "image": image.detach(),
+            "intrinsics": intrinsics.detach() if intrinsics is not None else None,
+            "pose_w2c": pose_w2c.detach(),
+            "pi3_points": None if pi3_points is None else pi3_points.detach(),
+            "pi3_depth": None if pi3_depth is None else pi3_depth.detach(),
+            "dynamic_mask": None if dynamic_mask is None else dynamic_mask.detach(),
+            "confidence": None if confidence is None else confidence.detach(),
+            "is_keyframe_candidate": bool(is_keyframe_candidate),
+            "metadata": metadata or {},
+        }
+
+    def _sync_gaussian_backend(self, refine: bool = False):
+        if self.gaussian_bridge is None:
+            return
+        if refine and getattr(self.gaussian_bridge, "mapper", None) is not None:
+            frame_ids = sorted(self.gaussian_bridge.mapper.frames.keys())
+        else:
+            start = max(0, self.n - self.cfg.OPTIMIZATION_WINDOW)
+            frame_ids = [self._global_frame_id(local_id) for local_id in range(start, self.n)]
+        self.gaussian_bridge.notify_loop_closure(self._active_pose_provider, frame_ids, refine=refine)
 
     def load_long_term_loop_closure(self):
         try:
@@ -380,6 +459,7 @@ class DPVO:
             full_target, full_weight, self.init_inv_depth, confidences, lmbda, full_ii, full_jj, full_kk, t0, self.n, M=self.M, iterations=2, eff_impl=True, use_cov_adaptive=False,
             cov_steepness=self.cfg.COV_STEEPNESS, cov_threshold=self.cfg.COV_THRESHOLD)
         self.ran_global_ba[self.n] = True
+        self._sync_gaussian_backend()
 
     def update(self, cov=True):
         with Timer("other", enabled=self.enable_timing):
@@ -422,6 +502,7 @@ class DPVO:
             points = (points[...,1,1,:3] / points[...,1,1,3:]).reshape(-1, 3)
             
             self.pg.points_[:len(points)] = points[:]
+            self._sync_gaussian_backend(refine=True)
     
     
     def pi3_inference(self, id_list):
@@ -661,6 +742,25 @@ class DPVO:
             # color info for visualization
             clr = (clr[0,:,[2,1,0]] + 0.5) * (255.0 / 2)
             self.pg.colors_[i] = clr.to(torch.uint8)
+
+            if self.gaussian_bridge is not None:
+                packet = self._build_mapping_packet(
+                    frame_id=i,
+                    timestamp=float(i),
+                    image=(dpvo_image[0, 0] + 0.5) * 0.5,
+                    intrinsics=self._mapping_intrinsics(i, self.intrinsic_init_window[i]),
+                    pose_w2c=self._pose_w2c_matrix(i),
+                    pi3_points=pi3_points[i],
+                    pi3_depth=pi3_depths[i],
+                    dynamic_mask=pi3_dynamics[i],
+                    confidence=pi3_confidences[i],
+                    is_keyframe_candidate=(i == 0 or self._pose_motion_score(i) >= getattr(self.cfg, "GAUSSIAN_MIN_MOTION_SCORE", 0.0)),
+                    metadata={
+                        "stage": "initialization",
+                        "motion_score": self._pose_motion_score(i),
+                    },
+                )
+                self.gaussian_bridge.notify_new_keyframe(packet)
             
         for itr in range(12):
             self.update(cov=self.cfg.USE_COV_ADAPTIVE)
@@ -808,6 +908,26 @@ class DPVO:
         elif len(self.dpvo_init_window) == self.frame_for_init:
             self.initialization()
             self.is_initialized = True
+
+        if self.gaussian_bridge is not None and predict_points_vis is not None:
+            local_frame_id = self.n - 1
+            global_frame_id = self._global_frame_id(local_frame_id)
+            motion_score = self._pose_motion_score(local_frame_id)
+            packet = self._build_mapping_packet(
+                frame_id=global_frame_id,
+                timestamp=tstamp,
+                image=image.float() / 255.0,
+                intrinsics=self._mapping_intrinsics(local_frame_id, intrinsics),
+                pose_w2c=self._pose_w2c_matrix(local_frame_id),
+                pi3_points=predict_points_vis,
+                pi3_depth=pi3_depths[-1] if 'pi3_depths' in locals() else None,
+                dynamic_mask=dynamic_mask_vis,
+                confidence=confidence_vis,
+                is_keyframe_candidate=(global_frame_id == 0 or motion_score >= getattr(self.cfg, "GAUSSIAN_MIN_MOTION_SCORE", 0.0)),
+                metadata={"stage": "online", "motion_score": motion_score},
+            )
+            self.gaussian_bridge.notify_new_keyframe(packet)
+            self._sync_gaussian_backend(refine=False)
 
         if self.cfg.CLASSIC_LOOP_CLOSURE:
             self.long_term_lc.attempt_loop_closure(self.n)
