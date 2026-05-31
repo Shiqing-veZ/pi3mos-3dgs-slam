@@ -530,6 +530,35 @@ class GaussianModel:
                 state["exp_avg_sq"][mask] = 0
         return int(mask.sum().item())
 
+    def apply_anchor_pose_depth_update(self, kf_id, updated_xyz, scale_ratio=None):
+        if self._xyz is None or self._xyz.shape[0] == 0:
+            return 0
+        mask = self.unique_kfIDs.to(self._xyz.device) == int(kf_id)
+        if mask.sum() == 0:
+            return 0
+        if updated_xyz.shape[0] != int(mask.sum().item()):
+            return 0
+
+        with torch.no_grad():
+            self._xyz.data[mask] = updated_xyz.to(self._xyz.device, dtype=self._xyz.dtype)
+            if scale_ratio is not None:
+                scale_ratio = scale_ratio.to(self._scaling.device, dtype=self._scaling.dtype).clamp(min=0.7, max=1.35)
+                if self._scaling.shape[1] == 1:
+                    self._scaling.data[mask] = self._scaling.data[mask] + torch.log(scale_ratio).unsqueeze(-1)
+                else:
+                    self._scaling.data[mask] = self._scaling.data[mask] + torch.log(scale_ratio).unsqueeze(-1).repeat(1, self._scaling.shape[1])
+
+        if self.optimizer is not None:
+            xyz_state = self.optimizer.state.get(self._xyz, None)
+            if xyz_state is not None and "exp_avg" in xyz_state and "exp_avg_sq" in xyz_state:
+                xyz_state["exp_avg"][mask] = 0
+                xyz_state["exp_avg_sq"][mask] = 0
+            scaling_state = self.optimizer.state.get(self._scaling, None)
+            if scaling_state is not None and "exp_avg" in scaling_state and "exp_avg_sq" in scaling_state:
+                scaling_state["exp_avg"][mask] = 0
+                scaling_state["exp_avg_sq"][mask] = 0
+        return int(mask.sum().item())
+
     def replace_tensor_to_optimizer(self, tensor, name):
         optimizable_tensors = {}
         for group in self.optimizer.param_groups:

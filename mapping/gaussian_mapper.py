@@ -8,10 +8,17 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .gaussian_deformer import rigid_deform_points
+from .gaussian_deformer import pose_depth_deform_points, rigid_deform_points
 from .gaussian_frame import GaussianFrame
 from .gaussian_keyframe_db import GaussianKeyframeDB
-from .gaussian_losses import masked_depth_l1, masked_gradient_l1, masked_rgb_l1, masked_ssim
+from .gaussian_losses import (
+    masked_depth_gradient_l1,
+    masked_depth_l1,
+    masked_depth_relative_l1,
+    masked_gradient_l1,
+    masked_rgb_l1,
+    masked_ssim,
+)
 from .io_utils import save_ply
 from .gaussian_state import GaussianState
 
@@ -112,6 +119,14 @@ class GaussianMapper:
         self.gradient_loss_weight = float(getattr(cfg, "GAUSSIAN_GRADIENT_LOSS_WEIGHT", 0.15))
         self.max_total_points = int(getattr(cfg, "GAUSSIAN_MAX_TOTAL_POINTS", 30000))
         self.min_points_per_frame = int(getattr(cfg, "GAUSSIAN_MIN_POINTS_PER_FRAME", 400))
+        self.depth_loss_weight = float(getattr(cfg, "GAUSSIAN_DEPTH_LOSS_WEIGHT", 0.5))
+        self.depth_relative_loss_weight = float(getattr(cfg, "GAUSSIAN_DEPTH_RELATIVE_LOSS_WEIGHT", 0.2))
+        self.depth_gradient_loss_weight = float(getattr(cfg, "GAUSSIAN_DEPTH_GRADIENT_LOSS_WEIGHT", 0.1))
+        self.soft_static_power = float(getattr(cfg, "GAUSSIAN_SOFT_STATIC_POWER", 2.0))
+        self.confidence_power = float(getattr(cfg, "GAUSSIAN_CONFIDENCE_POWER", 1.0))
+        self.static_weight_floor = float(getattr(cfg, "GAUSSIAN_STATIC_WEIGHT_FLOOR", 0.05))
+        self.pose_depth_min_scale = float(getattr(cfg, "GAUSSIAN_POSE_DEPTH_MIN_SCALE", 0.7))
+        self.pose_depth_max_scale = float(getattr(cfg, "GAUSSIAN_POSE_DEPTH_MAX_SCALE", 1.35))
 
         self.keyframes = GaussianKeyframeDB(
             window_size=self.window_size,
@@ -294,6 +309,43 @@ class GaussianMapper:
             static_mask = (static_mask > 0.5).float()
         return static_mask.unsqueeze(0)
 
+    def _soft_static_weight(self, frame: GaussianFrame, target_hw: Tuple[int, int], device: torch.device) -> torch.Tensor:
+        weight = torch.ones(target_hw, device=device, dtype=torch.float32)
+
+        if frame.dynamic_mask is not None:
+            dyn = frame.dynamic_mask
+            if dyn.ndim == 3:
+                dyn = dyn.squeeze(0)
+            dyn = dyn.to(device=device, dtype=torch.float32)
+            if tuple(dyn.shape) != tuple(target_hw):
+                dyn = self._resize_like(dyn, target_hw).to(device=device)
+            static_prob = (1.0 - dyn.clamp(0.0, 1.0)).pow(self.soft_static_power)
+            weight = weight * static_prob
+
+        if frame.confidence is not None:
+            conf = frame.confidence
+            if conf.ndim == 3:
+                conf = conf.squeeze(0)
+            conf = conf.to(device=device, dtype=torch.float32)
+            if tuple(conf.shape) != tuple(target_hw):
+                conf = self._resize_like(conf, target_hw).to(device=device)
+            conf = conf.clamp(0.0, 1.0).pow(self.confidence_power)
+            weight = weight * conf
+
+        valid_rgb = None
+        if frame.image is not None:
+            rgb = self._normalize_image(frame.image).to(device)
+            if tuple(rgb.shape[-2:]) != tuple(target_hw):
+                rgb = F.interpolate(rgb.unsqueeze(0), size=target_hw, mode="bilinear", align_corners=False).squeeze(0)
+            valid_rgb = (rgb.sum(dim=0) > 0.01).float()
+            weight = weight * valid_rgb
+
+        if self.confidence_thresh > 0:
+            weight = torch.where(weight > self.static_weight_floor, weight, torch.zeros_like(weight))
+        else:
+            weight = weight.clamp(min=self.static_weight_floor)
+        return weight.unsqueeze(0)
+
     def _depth_mask(self, depth: Optional[torch.Tensor], target_hw: Tuple[int, int], device: torch.device) -> Optional[torch.Tensor]:
         if depth is None:
             return None
@@ -337,17 +389,21 @@ class GaussianMapper:
             target = F.interpolate(target.unsqueeze(0), size=image.shape[-2:], mode="bilinear", align_corners=False).squeeze(0)
         rendered = self._apply_exposure(image, viewpoint)
 
-        static_mask = self._static_mask(self.frames[frame_id], image.shape[-2:], image.device)
+        frame = self.frames[frame_id]
+        static_weight = self._soft_static_weight(frame, image.shape[-2:], image.device)
         depth_mask = self._depth_mask(viewpoint.depth, depth.shape[-2:], depth.device) if viewpoint.depth is not None else None
         gt_depth = viewpoint.depth.to(depth.device) if viewpoint.depth is not None else None
         if gt_depth is not None and gt_depth.shape != depth.shape:
             gt_depth = F.interpolate(gt_depth.unsqueeze(0).unsqueeze(0), size=depth.shape[-2:], mode="bilinear", align_corners=False).squeeze()
+        depth_weight = static_weight if depth_mask is None else static_weight * depth_mask
 
-        loss = masked_rgb_l1(rendered, target, static_mask)
-        loss = loss + 0.2 * masked_ssim(rendered, target, static_mask)
-        loss = loss + self.gradient_loss_weight * masked_gradient_l1(rendered, target, static_mask)
+        loss = masked_rgb_l1(rendered, target, static_weight)
+        loss = loss + 0.2 * masked_ssim(rendered, target, static_weight)
+        loss = loss + self.gradient_loss_weight * masked_gradient_l1(rendered, target, static_weight)
         if gt_depth is not None:
-            loss = loss + 0.5 * masked_depth_l1(depth, gt_depth, depth_mask)
+            loss = loss + self.depth_loss_weight * masked_depth_l1(depth, gt_depth, depth_weight)
+            loss = loss + self.depth_relative_loss_weight * masked_depth_relative_l1(depth, gt_depth, depth_weight)
+            loss = loss + self.depth_gradient_loss_weight * masked_depth_gradient_l1(depth, gt_depth, depth_weight)
         if opacity is not None:
             loss = loss + 0.01 * (1.0 - opacity).abs().mean()
 
@@ -523,6 +579,7 @@ class GaussianMapper:
             return
 
         pose_c2w = self._frame_pose_c2w(frame)
+        flat_idx = torch.nonzero(static_mask.reshape(-1), as_tuple=False).squeeze(-1)
         world_points = points.reshape(-1, 3)[static_mask.reshape(-1)]
         colors = self._normalize_image(frame.image)
         if colors.shape[0] == 3:
@@ -577,11 +634,32 @@ class GaussianMapper:
         self.state.add_initial_points(frame.frame_id, world_points, world_colors)
         self.state.register_anchor(
             frame.frame_id,
-            torch.nonzero(static_mask.reshape(-1), as_tuple=False).squeeze(-1),
+            flat_idx,
             frame.pose_w2c.detach().cpu(),
+            uv=self._flat_indices_to_uv(flat_idx, points.shape[:2]),
+            depth=points.reshape(-1, 3)[flat_idx][:, 2],
+            cam_points=points.reshape(-1, 3)[flat_idx],
         )
         self.last_synced_pose[frame.frame_id] = frame.pose_w2c.detach().cpu()
         self._enforce_point_budget()
+
+    def _flat_indices_to_uv(self, flat_idx: torch.Tensor, hw: Tuple[int, int]) -> torch.Tensor:
+        height, width = int(hw[0]), int(hw[1])
+        v = torch.div(flat_idx, width, rounding_mode="floor")
+        u = flat_idx % width
+        return torch.stack([u, v], dim=-1)
+
+    def _sample_frame_depth(self, frame: GaussianFrame, anchor) -> Optional[torch.Tensor]:
+        depth_map = frame.pi3_depth
+        if depth_map is None or anchor.uv is None:
+            return None
+        if depth_map.ndim == 3:
+            depth_map = depth_map.squeeze(0)
+        uv = anchor.uv.to(depth_map.device)
+        h, w = depth_map.shape[-2:]
+        u = uv[:, 0].long().clamp(0, w - 1)
+        v = uv[:, 1].long().clamp(0, h - 1)
+        return depth_map[v, u]
 
     def _make_viewpoint(self, frame_id: int) -> Optional[_GaussianViewpoint]:
         frame = self.frames.get(frame_id)
@@ -736,12 +814,39 @@ class GaussianMapper:
         if anchor is not None and self.deform_on_ba:
             old_pose = anchor.pose_w2c.to(self.device)
             new_pose = pose_w2c.to(self.device)
+            frame_depth = None
+            use_depth_update = False
             if self.gaussian_model is not None:
-                self.gaussian_model.apply_anchor_pose_update(frame_id, old_pose, new_pose)
+                frame_depth = self._sample_frame_depth(frame, anchor)
+                anchor_cam_points = None if anchor.cam_points is None else anchor.cam_points.to(self.device)
+                ref_depth = None if anchor.depth is None else anchor.depth.to(self.device)
+                use_depth_update = frame_depth is not None and ref_depth is not None and anchor_cam_points is not None
+                if use_depth_update:
+                    points_src = self.state.points_by_frame.get(frame_id)
+                    if points_src is None:
+                        self.gaussian_model.apply_anchor_pose_update(frame_id, old_pose, new_pose)
+                    else:
+                        updated_xyz, scale_ratio, updated_cam_points = pose_depth_deform_points(
+                            points_src.to(self.device),
+                            old_pose,
+                            new_pose,
+                            anchor_cam_points=anchor_cam_points,
+                            reference_depth=ref_depth,
+                            updated_depth=frame_depth.to(self.device),
+                            min_depth_scale=self.pose_depth_min_scale,
+                            max_depth_scale=self.pose_depth_max_scale,
+                        )
+                        self.gaussian_model.apply_anchor_pose_depth_update(frame_id, updated_xyz, scale_ratio=scale_ratio)
+                        self.state.points_by_frame[frame_id] = updated_xyz.detach().cpu()
+                        anchor.depth = frame_depth.detach().cpu()
+                        anchor.cam_points = updated_cam_points.detach().cpu()
+                else:
+                    self.gaussian_model.apply_anchor_pose_update(frame_id, old_pose, new_pose)
             if frame_id in self.state.points_by_frame:
-                points = self.state.points_by_frame[frame_id].to(self.device)
-                updated = rigid_deform_points(points, old_pose, new_pose)
-                self.state.points_by_frame[frame_id] = updated.detach().cpu()
+                if not (use_depth_update and frame_depth is not None):
+                    points = self.state.points_by_frame[frame_id].to(self.device)
+                    updated = rigid_deform_points(points, old_pose, new_pose)
+                    self.state.points_by_frame[frame_id] = updated.detach().cpu()
             self.state.update_anchor_pose(frame_id, pose_w2c)
 
         frame.pose_w2c = pose_w2c

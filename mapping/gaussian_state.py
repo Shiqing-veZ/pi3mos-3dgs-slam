@@ -11,6 +11,7 @@ class GaussianAnchor:
     pose_w2c: torch.Tensor
     uv: Optional[torch.Tensor] = None
     depth: Optional[torch.Tensor] = None
+    cam_points: Optional[torch.Tensor] = None
 
 
 @dataclass
@@ -28,6 +29,7 @@ class GaussianState:
         pose_w2c: torch.Tensor,
         uv: Optional[torch.Tensor] = None,
         depth: Optional[torch.Tensor] = None,
+        cam_points: Optional[torch.Tensor] = None,
     ) -> None:
         self.anchors[frame_id] = GaussianAnchor(
             frame_id=frame_id,
@@ -35,6 +37,7 @@ class GaussianState:
             pose_w2c=pose_w2c.detach().cpu(),
             uv=None if uv is None else uv.detach().cpu(),
             depth=None if depth is None else depth.detach().cpu(),
+            cam_points=None if cam_points is None else cam_points.detach().cpu(),
         )
 
     def add_initial_points(self, frame_id: int, points: torch.Tensor, colors: torch.Tensor) -> None:
