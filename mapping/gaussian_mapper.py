@@ -116,6 +116,7 @@ class GaussianMapper:
         self.new_point_depth_rel_thresh = float(getattr(cfg, "GAUSSIAN_NEW_POINT_DEPTH_REL_THRESH", 0.20))
         self.texture_weight = float(getattr(cfg, "GAUSSIAN_TEXTURE_WEIGHT", 0.75))
         self.new_point_residual_thresh = float(getattr(cfg, "GAUSSIAN_NEW_POINT_RESIDUAL_THRESH", 0.12))
+        self.dssim_weight = float(np.clip(getattr(cfg, "GAUSSIAN_DSSIM_WEIGHT", 0.3), 0.0, 1.0))
         self.gradient_loss_weight = float(getattr(cfg, "GAUSSIAN_GRADIENT_LOSS_WEIGHT", 0.15))
         self.max_total_points = int(getattr(cfg, "GAUSSIAN_MAX_TOTAL_POINTS", 30000))
         self.min_points_per_frame = int(getattr(cfg, "GAUSSIAN_MIN_POINTS_PER_FRAME", 400))
@@ -397,8 +398,9 @@ class GaussianMapper:
             gt_depth = F.interpolate(gt_depth.unsqueeze(0).unsqueeze(0), size=depth.shape[-2:], mode="bilinear", align_corners=False).squeeze()
         depth_weight = static_weight if depth_mask is None else static_weight * depth_mask
 
-        loss = masked_rgb_l1(rendered, target, static_weight)
-        loss = loss + 0.2 * masked_ssim(rendered, target, static_weight)
+        rgb_l1 = masked_rgb_l1(rendered, target, static_weight)
+        rgb_ssim = masked_ssim(rendered, target, static_weight)
+        loss = (1.0 - self.dssim_weight) * rgb_l1 + self.dssim_weight * rgb_ssim
         loss = loss + self.gradient_loss_weight * masked_gradient_l1(rendered, target, static_weight)
         if gt_depth is not None:
             loss = loss + self.depth_loss_weight * masked_depth_l1(depth, gt_depth, depth_weight)
@@ -455,9 +457,9 @@ class GaussianMapper:
             sh_dim = (self.gaussian_model.max_sh_degree + 1) ** 2 if self.gaussian_model is not None else 1
             features = torch.zeros((fused_color.shape[0], 3, sh_dim), device=self.device)
             features[:, :, 0] = fused_color
-            dist2 = torch.clamp_min(distCUDA2(points_world), 1e-7) * 0.003
+            dist2 = torch.clamp_min(distCUDA2(points_world), 1e-7) * 0.0015
             scales = torch.log(torch.sqrt(dist2))[..., None].repeat(1, 3)
-            scales = torch.clamp(scales, min=float(np.log(0.002)), max=float(np.log(0.02)))
+            scales = torch.clamp(scales, min=float(np.log(0.001)), max=float(np.log(0.01)))
             rots = torch.zeros((points_world.shape[0], 4), device=self.device)
             rots[:, 0] = 1.0
             opacities = inverse_sigmoid(0.2 * torch.ones((points_world.shape[0], 1), device=self.device))
@@ -466,7 +468,7 @@ class GaussianMapper:
             sh_dim = (self.gaussian_model.max_sh_degree + 1) ** 2 if self.gaussian_model is not None else 1
             features = torch.zeros((points_world.shape[0], 3, sh_dim), device=self.device)
             features[:, :, 0] = colors_rgb
-            scales = torch.log(0.003 * torch.ones((points_world.shape[0], 3), device=self.device))
+            scales = torch.log(0.0015 * torch.ones((points_world.shape[0], 3), device=self.device))
             rots = torch.zeros((points_world.shape[0], 4), device=self.device)
             rots[:, 0] = 1.0
             opacities = torch.full((points_world.shape[0], 1), -1.38629436, device=self.device)
