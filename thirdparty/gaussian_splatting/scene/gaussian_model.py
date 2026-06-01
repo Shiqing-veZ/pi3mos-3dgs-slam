@@ -402,6 +402,10 @@ class GaussianModel:
         opacities_new = inverse_sigmoid(torch.ones_like(self.get_opacity) * 0.4)
 
         for filter in visibility_filters:
+            if filter is None:
+                continue
+            if filter.shape[0] != opacities_new.shape[0]:
+                continue
             opacities_new[filter] = self.get_opacity[filter]
         optimizable_tensors = self.replace_tensor_to_optimizer(opacities_new, "opacity")
         self._opacity = optimizable_tensors["opacity"]

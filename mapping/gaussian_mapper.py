@@ -418,9 +418,15 @@ class GaussianMapper:
         self.gaussian_model.update_learning_rate(self.map_step + 1)
         self.map_step += 1
 
-        if visible_ratio < self.visibility_reset_threshold and self.stage != "bootstrapping":
+        if (
+            visible_ratio < self.visibility_reset_threshold
+            and self.stage != "bootstrapping"
+            and visibility is not None
+            and visibility.shape[0] == self.gaussian_model.get_xyz.shape[0]
+        ):
             self.gaussian_model.reset_opacity_nonvisible([visibility])
 
+        densified_this_step = False
         if update_densify and self.densify_every > 0 and self.map_step % self.densify_every == 0:
             self.gaussian_model.densify_and_prune(
                 max_grad=0.0002,
@@ -428,7 +434,14 @@ class GaussianMapper:
                 extent=6.0,
                 max_screen_size=None,
             )
-        if self.opacity_reset_every > 0 and self.map_step % self.opacity_reset_every == 0 and visibility is not None:
+            densified_this_step = True
+        if (
+            self.opacity_reset_every > 0
+            and self.map_step % self.opacity_reset_every == 0
+            and visibility is not None
+            and not densified_this_step
+            and visibility.shape[0] == self.gaussian_model.get_xyz.shape[0]
+        ):
             self.gaussian_model.reset_opacity_nonvisible([visibility])
         return True
 
